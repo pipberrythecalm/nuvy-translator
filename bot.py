@@ -43,7 +43,7 @@ tree = app_commands.CommandTree(client)
 
 
 # =========================================================
-# CACHE
+# CACHES
 # =========================================================
 
 # (guild_id, channel_id) -> informações do grupo
@@ -52,7 +52,7 @@ group_cache = {}
 # channel_id -> webhook
 webhook_cache = {}
 
-# ("pt", "en") -> tradutor Argos carregado
+# ("pt", "en") -> tradutor carregado
 translator_cache = {}
 
 
@@ -61,8 +61,10 @@ translator_cache = {}
 # =========================================================
 
 def init_db():
+
     conn = sqlite3.connect(DB_PATH)
 
+    # Tabela dos grupos
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS translation_groups (
@@ -75,6 +77,50 @@ def init_db():
         """
     )
 
+    # -----------------------------------------------------
+    # MIGRAÇÃO:
+    # adiciona a coluna "name" caso o banco seja antigo
+    # -----------------------------------------------------
+
+    columns = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(translation_groups)"
+        ).fetchall()
+    }
+
+    if "name" not in columns:
+
+        conn.execute(
+            """
+            ALTER TABLE translation_groups
+            ADD COLUMN name TEXT
+            """
+        )
+
+    # Grupos antigos recebem nome automático
+    conn.execute(
+        """
+        UPDATE translation_groups
+        SET name = 'Group ' || id
+        WHERE name IS NULL
+        OR TRIM(name) = ''
+        """
+    )
+
+    # Evita dois grupos com mesmo nome no mesmo servidor
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_translation_group_name
+        ON translation_groups(
+            guild_id,
+            name COLLATE NOCASE
+        )
+        """
+    )
+
+    # Relação entre mensagens PT / EN / ES
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS message_links (
@@ -92,7 +138,12 @@ def init_db():
     conn.close()
 
 
+# =========================================================
+# CACHE DOS GRUPOS
+# =========================================================
+
 def load_group_cache():
+
     global group_cache
 
     conn = sqlite3.connect(DB_PATH)
@@ -102,6 +153,7 @@ def load_group_cache():
         SELECT
             id,
             guild_id,
+            name,
             pt_channel_id,
             en_channel_id,
             es_channel_id
@@ -113,10 +165,18 @@ def load_group_cache():
 
     group_cache = {}
 
-    for group_id, guild_id, pt_id, en_id, es_id in rows:
+    for (
+        group_id,
+        guild_id,
+        name,
+        pt_id,
+        en_id,
+        es_id
+    ) in rows:
 
         group_data = {
             "id": group_id,
+            "name": name,
             "pt": pt_id,
             "en": en_id,
             "es": es_id,
@@ -126,24 +186,89 @@ def load_group_cache():
         group_cache[(guild_id, en_id)] = group_data
         group_cache[(guild_id, es_id)] = group_data
 
-    print(f"☁️ Translation groups loaded: {len(rows)}")
+    print(
+        f"☁️ Translation groups loaded: "
+        f"{len(rows)}"
+    )
 
 
-def add_group(guild_id, pt_id, en_id, es_id):
+# =========================================================
+# FUNÇÕES DOS GRUPOS
+# =========================================================
+
+def get_groups(guild_id):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            name,
+            pt_channel_id,
+            en_channel_id,
+            es_channel_id
+        FROM translation_groups
+        WHERE guild_id = ?
+        ORDER BY name COLLATE NOCASE
+        """,
+        (guild_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def group_name_exists(guild_id, name):
+
+    conn = sqlite3.connect(DB_PATH)
+
+    row = conn.execute(
+        """
+        SELECT id
+        FROM translation_groups
+        WHERE guild_id = ?
+        AND name = ? COLLATE NOCASE
+        LIMIT 1
+        """,
+        (
+            guild_id,
+            name.strip()
+        )
+    ).fetchone()
+
+    conn.close()
+
+    return row is not None
+
+
+def add_group(
+    guild_id,
+    name,
+    pt_id,
+    en_id,
+    es_id
+):
+
+    clean_name = name.strip()
+
     conn = sqlite3.connect(DB_PATH)
 
     cursor = conn.execute(
         """
         INSERT INTO translation_groups (
             guild_id,
+            name,
             pt_channel_id,
             en_channel_id,
             es_channel_id
         )
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (
             guild_id,
+            clean_name,
             pt_id,
             en_id,
             es_id
@@ -160,32 +285,50 @@ def add_group(guild_id, pt_id, en_id, es_id):
     return group_id
 
 
-def get_groups(guild_id):
+def delete_group_by_name(
+    guild_id,
+    group_name
+):
+
     conn = sqlite3.connect(DB_PATH)
 
-    rows = conn.execute(
+    row = conn.execute(
         """
-        SELECT
-            id,
-            pt_channel_id,
-            en_channel_id,
-            es_channel_id
+        SELECT id, name
         FROM translation_groups
         WHERE guild_id = ?
-        ORDER BY id
+        AND name = ? COLLATE NOCASE
+        LIMIT 1
         """,
-        (guild_id,)
-    ).fetchall()
+        (
+            guild_id,
+            group_name.strip()
+        )
+    ).fetchone()
 
-    conn.close()
+    if row is None:
 
-    return rows
+        conn.close()
 
+        return None
 
-def delete_group(guild_id, group_id):
-    conn = sqlite3.connect(DB_PATH)
+    group_id, actual_name = row
 
-    cursor = conn.execute(
+    # Limpa vínculos de mensagens desse grupo
+    conn.execute(
+        """
+        DELETE FROM message_links
+        WHERE guild_id = ?
+        AND group_id = ?
+        """,
+        (
+            guild_id,
+            group_id
+        )
+    )
+
+    # Remove o grupo
+    conn.execute(
         """
         DELETE FROM translation_groups
         WHERE guild_id = ?
@@ -198,16 +341,16 @@ def delete_group(guild_id, group_id):
     )
 
     conn.commit()
-
-    deleted = cursor.rowcount > 0
-
     conn.close()
 
-    if deleted:
-        load_group_cache()
+    load_group_cache()
 
-    return deleted
+    return actual_name
 
+
+# =========================================================
+# VÍNCULO ENTRE MENSAGENS
+# =========================================================
 
 def save_message_link(
     guild_id,
@@ -216,6 +359,7 @@ def save_message_link(
     en_message_id=None,
     es_message_id=None
 ):
+
     conn = sqlite3.connect(DB_PATH)
 
     conn.execute(
@@ -242,7 +386,11 @@ def save_message_link(
     conn.close()
 
 
-def get_message_link(guild_id, message_id):
+def get_message_link(
+    guild_id,
+    message_id
+):
+
     conn = sqlite3.connect(DB_PATH)
 
     row = conn.execute(
@@ -274,7 +422,12 @@ def get_message_link(guild_id, message_id):
     if row is None:
         return None
 
-    group_id, pt_id, en_id, es_id = row
+    (
+        group_id,
+        pt_id,
+        en_id,
+        es_id
+    ) = row
 
     return {
         "group_id": group_id,
@@ -290,16 +443,20 @@ def get_message_link(guild_id, message_id):
 
 def install_argos_models():
 
-    print("☁️ Checking translation models...")
+    print(
+        "☁️ Checking translation models..."
+    )
 
     argostranslate.package.update_package_index()
 
     available_packages = (
-        argostranslate.package.get_available_packages()
+        argostranslate.package
+        .get_available_packages()
     )
 
     installed_packages = (
-        argostranslate.package.get_installed_packages()
+        argostranslate.package
+        .get_installed_packages()
     )
 
     required_pairs = [
@@ -310,18 +467,23 @@ def install_argos_models():
     ]
 
     def is_installed(source, target):
+
         return any(
             package.from_code == source
             and package.to_code == target
             for package in installed_packages
         )
 
+    # Modelos obrigatórios
     for source, target in required_pairs:
 
-        if is_installed(source, target):
+        if is_installed(
+            source,
+            target
+        ):
 
             print(
-                f"✓ Model already installed: "
+                f"✓ Model installed: "
                 f"{source} → {target}"
             )
 
@@ -329,7 +491,8 @@ def install_argos_models():
 
         package = next(
             (
-                p for p in available_packages
+                p
+                for p in available_packages
                 if p.from_code == source
                 and p.to_code == target
             ),
@@ -337,8 +500,9 @@ def install_argos_models():
         )
 
         if package is None:
+
             raise RuntimeError(
-                f"Required translation model not found: "
+                f"Required model not found: "
                 f"{source} → {target}"
             )
 
@@ -347,24 +511,20 @@ def install_argos_models():
             f"{source} → {target}"
         )
 
-        download_path = package.download()
+        download_path = (
+            package.download()
+        )
 
         argostranslate.package.install_from_path(
             download_path
         )
 
         installed_packages = (
-            argostranslate.package.get_installed_packages()
+            argostranslate.package
+            .get_installed_packages()
         )
 
-        print(
-            f"✓ Installed: "
-            f"{source} → {target}"
-        )
-
-    # Tenta instalar modelos PT ↔ ES diretamente.
-    # Caso não existam, Nuvy usa inglês como ponte.
-
+    # Modelos diretos opcionais PT ↔ ES
     optional_pairs = [
         ("pt", "es"),
         ("es", "pt"),
@@ -372,12 +532,16 @@ def install_argos_models():
 
     for source, target in optional_pairs:
 
-        if is_installed(source, target):
+        if is_installed(
+            source,
+            target
+        ):
             continue
 
         package = next(
             (
-                p for p in available_packages
+                p
+                for p in available_packages
                 if p.from_code == source
                 and p.to_code == target
             ),
@@ -394,28 +558,30 @@ def install_argos_models():
                 f"{source} → {target}"
             )
 
-            download_path = package.download()
+            download_path = (
+                package.download()
+            )
 
             argostranslate.package.install_from_path(
                 download_path
             )
 
             installed_packages = (
-                argostranslate.package.get_installed_packages()
-            )
-
-            print(
-                f"✓ Optional model installed: "
-                f"{source} → {target}"
+                argostranslate.package
+                .get_installed_packages()
             )
 
         except Exception as error:
 
             print(
                 f"⚠️ Optional model skipped: "
-                f"{source} → {target}: {error}"
+                f"{error}"
             )
 
+
+# =========================================================
+# CACHE DOS TRADUTORES
+# =========================================================
 
 def build_translator_cache():
 
@@ -424,7 +590,8 @@ def build_translator_cache():
     translator_cache = {}
 
     languages = (
-        argostranslate.translate.get_installed_languages()
+        argostranslate.translate
+        .get_installed_languages()
     )
 
     language_map = {
@@ -443,16 +610,25 @@ def build_translator_cache():
 
     for source, target in pairs:
 
-        source_language = language_map.get(source)
-        target_language = language_map.get(target)
+        source_language = (
+            language_map.get(source)
+        )
 
-        if not source_language or not target_language:
+        target_language = (
+            language_map.get(target)
+        )
+
+        if (
+            not source_language
+            or not target_language
+        ):
             continue
 
         try:
 
             translation = (
-                source_language.get_translation(
+                source_language
+                .get_translation(
                     target_language
                 )
             )
@@ -470,13 +646,20 @@ def build_translator_cache():
             pass
 
 
-def translate_direct(text, source, target):
+def translate_direct(
+    text,
+    source,
+    target
+):
 
-    translator = translator_cache.get(
-        (source, target)
+    translator = (
+        translator_cache.get(
+            (source, target)
+        )
     )
 
     if translator is None:
+
         raise RuntimeError(
             f"Translator unavailable: "
             f"{source} → {target}"
@@ -486,7 +669,11 @@ def translate_direct(text, source, target):
 
 
 @lru_cache(maxsize=3000)
-def translate_cached(text, source, target):
+def translate_cached(
+    text,
+    source,
+    target
+):
 
     if source == target:
         return text
@@ -496,10 +683,14 @@ def translate_cached(text, source, target):
     )
 
     if direct is not None:
+
         return direct.translate(text)
 
-    # PT → ES via inglês
-    if source == "pt" and target == "es":
+    # Português → Espanhol via Inglês
+    if (
+        source == "pt"
+        and target == "es"
+    ):
 
         english = translate_direct(
             text,
@@ -513,8 +704,11 @@ def translate_cached(text, source, target):
             "es"
         )
 
-    # ES → PT via inglês
-    if source == "es" and target == "pt":
+    # Espanhol → Português via Inglês
+    if (
+        source == "es"
+        and target == "pt"
+    ):
 
         english = translate_direct(
             text,
@@ -540,26 +734,39 @@ def translate_cached(text, source, target):
 
 async def get_nuvy_webhook(channel):
 
-    cached = webhook_cache.get(channel.id)
+    cached = webhook_cache.get(
+        channel.id
+    )
 
     if cached is not None:
         return cached
 
-    webhooks = await channel.webhooks()
+    webhooks = (
+        await channel.webhooks()
+    )
 
     for webhook in webhooks:
 
-        if webhook.name == "Nuvy Translator":
+        if (
+            webhook.name
+            == "Nuvy Translator"
+        ):
 
-            webhook_cache[channel.id] = webhook
+            webhook_cache[
+                channel.id
+            ] = webhook
 
             return webhook
 
-    webhook = await channel.create_webhook(
-        name="Nuvy Translator"
+    webhook = (
+        await channel.create_webhook(
+            name="Nuvy Translator"
+        )
     )
 
-    webhook_cache[channel.id] = webhook
+    webhook_cache[
+        channel.id
+    ] = webhook
 
     return webhook
 
@@ -567,13 +774,44 @@ async def get_nuvy_webhook(channel):
 async def warm_webhook(channel):
 
     try:
-        await get_nuvy_webhook(channel)
+
+        await get_nuvy_webhook(
+            channel
+        )
 
     except Exception as error:
 
         print(
-            f"⚠️ Webhook error in "
-            f"#{channel.name}: {error}"
+            f"⚠️ Webhook error "
+            f"in #{channel.name}: "
+            f"{error}"
+        )
+
+
+async def prepare_group_webhooks(
+    portugues,
+    english,
+    espanhol
+):
+
+    try:
+
+        await asyncio.gather(
+            warm_webhook(portugues),
+            warm_webhook(english),
+            warm_webhook(espanol)
+        )
+
+        print(
+            "✓ Translation group "
+            "webhooks prepared."
+        )
+
+    except Exception as error:
+
+        print(
+            f"⚠️ Error preparing "
+            f"webhooks: {error}"
         )
 
 
@@ -587,11 +825,16 @@ async def get_reply_information(
     target_channel
 ):
 
-    if original_message.reference is None:
+    if (
+        original_message.reference
+        is None
+    ):
         return None
 
     referenced_id = (
-        original_message.reference.message_id
+        original_message
+        .reference
+        .message_id
     )
 
     if referenced_id is None:
@@ -605,8 +848,10 @@ async def get_reply_information(
     if link is None:
         return None
 
-    target_message_id = link.get(
-        target_language
+    target_message_id = (
+        link.get(
+            target_language
+        )
     )
 
     if target_message_id is None:
@@ -614,13 +859,12 @@ async def get_reply_information(
 
     try:
 
-        target_message = (
-            await target_channel.fetch_message(
+        return (
+            await target_channel
+            .fetch_message(
                 target_message_id
             )
         )
-
-        return target_message
 
     except Exception:
         return None
@@ -633,8 +877,10 @@ async def send_translation(
     target_language
 ):
 
-    webhook = await get_nuvy_webhook(
-        target_channel
+    webhook = (
+        await get_nuvy_webhook(
+            target_channel
+        )
     )
 
     replied_message = (
@@ -645,14 +891,17 @@ async def send_translation(
         )
     )
 
-    # Webhooks não oferecem reply nativo confiável
-    # em todas as versões do discord.py.
-    # Portanto usamos uma prévia visual quando necessário.
+    # -----------------------------------------------------
+    # Se for reply, mostra a mensagem correspondente
+    # traduzida no canal de destino
+    # -----------------------------------------------------
 
     if replied_message is not None:
 
         reply_author = (
-            replied_message.author.display_name
+            replied_message
+            .author
+            .display_name
         )
 
         reply_preview = (
@@ -661,9 +910,11 @@ async def send_translation(
             else "message"
         )
 
-        if len(reply_preview) > 100:
+        if len(reply_preview) > 120:
+
             reply_preview = (
-                reply_preview[:100] + "…"
+                reply_preview[:120]
+                + "…"
             )
 
         translated_text = (
@@ -675,11 +926,15 @@ async def send_translation(
     sent_message = await webhook.send(
         content=translated_text,
         username=(
-            original_message.author.display_name
+            original_message
+            .author
+            .display_name
         ),
         avatar_url=(
-            original_message.author
-            .display_avatar.url
+            original_message
+            .author
+            .display_avatar
+            .url
         ),
         allowed_mentions=(
             discord.AllowedMentions.none()
@@ -697,19 +952,23 @@ async def send_translation(
 def guild_allowed(interaction):
 
     return (
-        interaction.guild is not None
+        interaction.guild
+        is not None
         and interaction.guild.id
         in ALLOWED_GUILDS
     )
 
 
-def can_manage_translation(interaction):
+def can_manage_translation(
+    interaction
+):
 
     if interaction.guild is None:
         return False
 
     permissions = (
-        interaction.user.guild_permissions
+        interaction.user
+        .guild_permissions
     )
 
     return (
@@ -732,27 +991,81 @@ async def reject_unauthorized_guild(
 
 
 # =========================================================
+# AUTOCOMPLETE DOS GRUPOS
+# =========================================================
+
+async def group_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    if (
+        interaction.guild is None
+        or interaction.guild.id
+        not in ALLOWED_GUILDS
+    ):
+        return []
+
+    groups = get_groups(
+        interaction.guild.id
+    )
+
+    current_lower = (
+        current.lower().strip()
+    )
+
+    choices = []
+
+    for (
+        _group_id,
+        name,
+        _pt,
+        _en,
+        _es
+    ) in groups:
+
+        if (
+            not current_lower
+            or current_lower
+            in name.lower()
+        ):
+
+            choices.append(
+                app_commands.Choice(
+                    name=name,
+                    value=name
+                )
+            )
+
+    # Discord permite no máximo 25
+    return choices[:25]
+
+
+# =========================================================
 # /LINK
 # =========================================================
 
 @tree.command(
     name="link",
     description=(
-        "Connect PT-BR, English and Spanish channels."
+        "Create a translation group."
     )
 )
 @app_commands.describe(
+    nome="Name of the translation group",
     portugues="Portuguese channel",
     english="English channel",
     espanhol="Spanish channel"
 )
 async def link(
     interaction: discord.Interaction,
+    nome: str,
     portugues: discord.TextChannel,
     english: discord.TextChannel,
     espanhol: discord.TextChannel
 ):
 
+    # Servidor permitido?
     if not guild_allowed(interaction):
 
         await reject_unauthorized_guild(
@@ -761,12 +1074,59 @@ async def link(
 
         return
 
-    if not can_manage_translation(interaction):
+    # Permissão para configurar?
+    if not can_manage_translation(
+        interaction
+    ):
 
         await interaction.response.send_message(
             (
-                "☁️ You need Manage Server permission "
-                "to use this command."
+                "☁️ You need Manage Server "
+                "permission to use this command."
+            ),
+            ephemeral=True
+        )
+
+        return
+
+    clean_name = nome.strip()
+
+    # Nome vazio ou exageradamente curto
+    if len(clean_name) < 2:
+
+        await interaction.response.send_message(
+            (
+                "☁️ Please choose a name "
+                "for this translation group."
+            ),
+            ephemeral=True
+        )
+
+        return
+
+    if len(clean_name) > 40:
+
+        await interaction.response.send_message(
+            (
+                "☁️ Group names can have "
+                "up to 40 characters."
+            ),
+            ephemeral=True
+        )
+
+        return
+
+    # Nome já existe?
+    if group_name_exists(
+        interaction.guild.id,
+        clean_name
+    ):
+
+        await interaction.response.send_message(
+            (
+                f"☁️ A translation group "
+                f"named **{clean_name}** "
+                f"already exists."
             ),
             ephemeral=True
         )
@@ -779,6 +1139,7 @@ async def link(
         espanhol.id
     }
 
+    # Canais precisam ser diferentes
     if len(selected_ids) != 3:
 
         await interaction.response.send_message(
@@ -791,6 +1152,8 @@ async def link(
 
         return
 
+    # Um canal não pode pertencer
+    # a dois grupos diferentes
     for channel_id in selected_ids:
 
         if (
@@ -798,40 +1161,58 @@ async def link(
             channel_id
         ) in group_cache:
 
+            existing_group = (
+                group_cache[
+                    (
+                        interaction.guild.id,
+                        channel_id
+                    )
+                ]
+            )
+
             await interaction.response.send_message(
                 (
                     "☁️ One of these channels "
-                    "already belongs to another "
-                    "translation group."
+                    "already belongs to "
+                    f"**{existing_group['name']}**."
                 ),
                 ephemeral=True
             )
 
             return
 
+    # Salva o grupo
     group_id = add_group(
         interaction.guild.id,
+        clean_name,
         portugues.id,
         english.id,
         espanhol.id
     )
 
-    await interaction.response.defer()
+    # -----------------------------------------------------
+    # IMPORTANTE:
+    # responde imediatamente.
+    # Não espera os webhooks.
+    # Corrige o "Nuvy está pensando..."
+    # -----------------------------------------------------
 
-    # Cria/cacheia os três webhooks imediatamente.
-    await asyncio.gather(
-        warm_webhook(portugues),
-        warm_webhook(english),
-        warm_webhook(espanol)
-    )
-
-    await interaction.followup.send(
+    await interaction.response.send_message(
         (
-            f"☁️ **Translation group "
-            f"{group_id} connected!**\n\n"
+            f"☁️ **{clean_name} connected!**\n\n"
             f"🇧🇷 {portugues.mention}\n"
             f"🇺🇸 {english.mention}\n"
-            f"🇪🇸 {espanhol.mention}"
+            f"🇪🇸 {espanhol.mention}\n\n"
+            f"Group ID: `{group_id}`"
+        )
+    )
+
+    # Webhooks preparados em segundo plano
+    asyncio.create_task(
+        prepare_group_webhooks(
+            portugues,
+            english,
+            espanhol
         )
     )
 
@@ -877,7 +1258,8 @@ async def groups(
     blocks = []
 
     for (
-        group_id,
+        _group_id,
+        name,
         pt_id,
         en_id,
         es_id
@@ -885,7 +1267,7 @@ async def groups(
 
         blocks.append(
             (
-                f"**Group {group_id}**\n"
+                f"### ☁️ {name}\n"
                 f"🇧🇷 <#{pt_id}>\n"
                 f"🇺🇸 <#{en_id}>\n"
                 f"🇪🇸 <#{es_id}>"
@@ -894,7 +1276,7 @@ async def groups(
 
     await interaction.response.send_message(
         (
-            "☁️ **Nuvy Translation Groups**\n\n"
+            "## ☁️ Nuvy Translation Groups\n\n"
             + "\n\n".join(blocks)
         )
     )
@@ -907,15 +1289,18 @@ async def groups(
 @tree.command(
     name="unlink",
     description=(
-        "Remove a Nuvy translation group."
+        "Remove a translation group."
     )
 )
 @app_commands.describe(
-    group_id="Group ID shown by /groups"
+    grupo="Choose the translation group"
+)
+@app_commands.autocomplete(
+    grupo=group_autocomplete
 )
 async def unlink(
     interaction: discord.Interaction,
-    group_id: int
+    grupo: str
 ):
 
     if not guild_allowed(interaction):
@@ -926,41 +1311,43 @@ async def unlink(
 
         return
 
-    if not can_manage_translation(interaction):
+    if not can_manage_translation(
+        interaction
+    ):
 
         await interaction.response.send_message(
             (
-                "☁️ You need Manage Server permission "
-                "to use this command."
+                "☁️ You need Manage Server "
+                "permission to use this command."
             ),
             ephemeral=True
         )
 
         return
 
-    deleted = delete_group(
+    removed_name = delete_group_by_name(
         interaction.guild.id,
-        group_id
+        grupo
     )
 
-    if deleted:
+    if removed_name is None:
 
         await interaction.response.send_message(
             (
-                f"☁️ Translation group "
-                f"{group_id} removed."
-            )
-        )
-
-    else:
-
-        await interaction.response.send_message(
-            (
-                "☁️ Translation group "
-                "not found."
+                f"☁️ I couldn't find a group "
+                f"named **{grupo}**."
             ),
             ephemeral=True
         )
+
+        return
+
+    await interaction.response.send_message(
+        (
+            f"☁️ Translation group "
+            f"**{removed_name}** removed."
+        )
+    )
 
 
 # =========================================================
@@ -1003,7 +1390,7 @@ async def nuvy_status(
 
 
 # =========================================================
-# PROCESSAR UMA TRADUÇÃO
+# TRADUZIR PARA UM CANAL
 # =========================================================
 
 async def process_target(
@@ -1013,8 +1400,10 @@ async def process_target(
     target_channel_id
 ):
 
-    target_channel = client.get_channel(
-        target_channel_id
+    target_channel = (
+        client.get_channel(
+            target_channel_id
+        )
     )
 
     if target_channel is None:
@@ -1035,11 +1424,13 @@ async def process_target(
             target_language
         )
 
-        sent_message = await send_translation(
-            target_channel,
-            original_message,
-            translated,
-            target_language
+        sent_message = (
+            await send_translation(
+                target_channel,
+                original_message,
+                translated,
+                target_language
+            )
         )
 
         print(
@@ -1066,7 +1457,7 @@ async def process_target(
 
 
 # =========================================================
-# MENSAGENS
+# RECEBER MENSAGENS
 # =========================================================
 
 @client.event
@@ -1076,19 +1467,23 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Ignora os próprios webhooks
+    # Ignora mensagens criadas
+    # pelos próprios webhooks
     if message.webhook_id is not None:
         return
 
-    # Ignora DMs
+    # Ignora DM
     if message.guild is None:
         return
 
-    # BLOQUEIA servidores não autorizados
-    if message.guild.id not in ALLOWED_GUILDS:
+    # Ignora servidor não autorizado
+    if (
+        message.guild.id
+        not in ALLOWED_GUILDS
+    ):
         return
 
-    # Por enquanto traduz apenas mensagens com texto
+    # Por enquanto precisa ter texto
     if not message.content.strip():
         return
 
@@ -1099,7 +1494,7 @@ async def on_message(message):
         )
     )
 
-    # Canal não pertence a nenhum grupo
+    # Canal não pertence a grupo algum
     if group is None:
         return
 
@@ -1128,14 +1523,15 @@ async def on_message(message):
         "es": None
     }
 
-    # Salva a mensagem original
+    # ID da mensagem original
     message_ids[
         source_language
     ] = message.id
 
     tasks = []
 
-    # Dispara as duas traduções simultaneamente
+    # Traduz simultaneamente
+    # para os outros dois idiomas
     for target_language in (
         "pt",
         "en",
@@ -1175,13 +1571,20 @@ async def on_message(message):
                 language
             ] = message_id
 
-    # Vincula as três versões da mensagem
+    # Guarda o vínculo entre
+    # as três versões da mensagem
     save_message_link(
         guild_id=message.guild.id,
         group_id=group["id"],
-        pt_message_id=message_ids["pt"],
-        en_message_id=message_ids["en"],
-        es_message_id=message_ids["es"]
+        pt_message_id=(
+            message_ids["pt"]
+        ),
+        en_message_id=(
+            message_ids["en"]
+        ),
+        es_message_id=(
+            message_ids["es"]
+        )
     )
 
 
@@ -1205,7 +1608,8 @@ async def on_guild_join(guild):
         await guild.leave()
 
         print(
-            f"☁️ Nuvy left unauthorized server: "
+            f"☁️ Nuvy left "
+            f"unauthorized server: "
             f"{guild.name}"
         )
 
@@ -1228,6 +1632,16 @@ async def on_ready():
 
     await tree.sync()
 
+    groups_count = (
+        len(
+            {
+                group["id"]
+                for group
+                in group_cache.values()
+            }
+        )
+    )
+
     print("")
     print("================================")
     print("☁️ NUVY ONLINE")
@@ -1236,8 +1650,8 @@ async def on_ready():
     print("Replies: enabled")
     print("Allowed servers: 3")
     print(
-        f"Translation groups in memory: "
-        f"{len(group_cache) // 3}"
+        f"Translation groups: "
+        f"{groups_count}"
     )
     print("================================")
     print("")
@@ -1248,6 +1662,7 @@ async def on_ready():
 # =========================================================
 
 if not TOKEN:
+
     raise RuntimeError(
         "DISCORD_TOKEN was not configured."
     )
