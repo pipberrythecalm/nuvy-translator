@@ -1039,4 +1039,60 @@ os.makedirs(
 init_db()
 load_group_cache()
 
+
+def start_model_setup():
+    """
+    Prepara os modelos Argos em um processo separado.
+
+    A Nuvy continua iniciando normalmente.
+    O Argos não fica carregado no processo principal.
+    """
+    import subprocess
+    import threading
+
+    def run_setup():
+        print("☁️ Checking Argos translation models...")
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "setup_models.py"
+                ],
+                env=worker_environment(),
+                text=True,
+                capture_output=True
+            )
+
+            if result.stdout:
+                print(result.stdout)
+
+            if result.returncode == 0:
+                print("☁️ Translation models are ready!")
+
+            else:
+                print(
+                    "❌ Model setup failed:"
+                )
+
+                if result.stderr:
+                    print(result.stderr)
+
+        except Exception as error:
+            print(
+                f"❌ Model setup error: {error}"
+            )
+
+    thread = threading.Thread(
+        target=run_setup,
+        daemon=True
+    )
+
+    thread.start()
+
+
+# Prepara os modelos separadamente.
+start_model_setup()
+
+# Discord inicia sem esperar o Argos.
 client.run(TOKEN)
